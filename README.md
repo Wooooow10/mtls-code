@@ -18,21 +18,29 @@ npm run build
 
 ## Run
 
-```bash
-export UPSTREAM_BASE_URL='https://llm-provider.example.com'
-export CLIENT_CERT_PATH='/absolute/path/client.crt'
-export CLIENT_KEY_PATH='/absolute/path/client.key'
-export LOCAL_AUTH_TOKEN='local-opencode-token'
+You can configure the proxy with a local `.env` file:
 
+```bash
+UPSTREAM_BASE_URL=https://llm-provider.example.com
+CLIENT_CERT_PATH=/absolute/path/client.crt
+CLIENT_KEY_PATH=/absolute/path/client.key
+LOCAL_AUTH_TOKEN=local-opencode-token
+```
+
+Then start the proxy:
+
+```bash
 npm start
 ```
+
+Shell environment variables still work. If a key is set in both places, the `.env` value wins.
 
 Set `UPSTREAM_BASE_URL` to the provider origin or path prefix before the OpenAI-compatible path that OpenCode sends. For example, if OpenCode uses local base URL `http://127.0.0.1:8787/v1`, use `https://llm-provider.example.com` or `https://llm-provider.example.com/openai`, not `https://llm-provider.example.com/v1`.
 
 If the endpoint uses a private CA, also set:
 
 ```bash
-export CA_CERT_PATH='/absolute/path/ca.crt'
+CA_CERT_PATH=/absolute/path/ca.crt
 ```
 
 Defaults:
@@ -52,6 +60,8 @@ Configure OpenCode as an OpenAI-compatible provider:
 
 ## Verify Direct Upstream mTLS
 
+These direct upstream checks use shell-expanded variables. Export the values first if you keep configuration only in `.env`.
+
 ```bash
 curl --cert "$CLIENT_CERT_PATH" --key "$CLIENT_KEY_PATH" \
   "$UPSTREAM_BASE_URL/v1/models"
@@ -69,7 +79,7 @@ curl --cert "$CLIENT_CERT_PATH" --key "$CLIENT_KEY_PATH" --cacert "$CA_CERT_PATH
 ## Verify Local Proxy
 
 ```bash
-curl -H "Authorization: Bearer $LOCAL_AUTH_TOKEN" \
+curl -H "Authorization: Bearer local-opencode-token" \
   "http://127.0.0.1:8787/v1/models"
 ```
 
@@ -78,7 +88,7 @@ Expected: JSON model response through the local proxy.
 ## Verify Chat Completion
 
 ```bash
-curl -H "Authorization: Bearer $LOCAL_AUTH_TOKEN" \
+curl -H "Authorization: Bearer local-opencode-token" \
   -H 'Content-Type: application/json' \
   -d '{"model":"MODEL_NAME","messages":[{"role":"user","content":"ping"}],"max_tokens":16}' \
   "http://127.0.0.1:8787/v1/chat/completions"

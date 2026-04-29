@@ -52,7 +52,51 @@ Defaults:
 
 ## OpenCode Configuration
 
-Configure OpenCode as an OpenAI-compatible provider:
+Configure OpenCode with a custom OpenAI-compatible provider that points at the local proxy. Add this to your global `~/.config/opencode/opencode.json` or to a project-local `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "mtls-proxy": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "mTLS Proxy",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "apiKey": "local-opencode-token"
+      },
+      "models": {
+        "MODEL_NAME": {
+          "name": "MODEL_NAME"
+        }
+      }
+    }
+  },
+  "model": "mtls-proxy/MODEL_NAME"
+}
+```
+
+Replace `MODEL_NAME` with a model supported by the upstream provider. The `apiKey` must match `LOCAL_AUTH_TOKEN` if the proxy is configured with one; otherwise use any non-empty dummy value accepted by OpenCode.
+
+You can also keep the token in an environment variable:
+
+```json
+"apiKey": "{env:OPENCODE_MTLS_PROXY_API_KEY}"
+```
+
+Then export it before starting OpenCode:
+
+```bash
+export OPENCODE_MTLS_PROXY_API_KEY=local-opencode-token
+```
+
+The proxy's `.env` file is only read by this proxy process, not by OpenCode. Start the proxy first with `npm start`, then start OpenCode and select the configured model:
+
+```bash
+opencode --model mtls-proxy/MODEL_NAME
+```
+
+Required values:
 
 - Base URL: `http://127.0.0.1:8787/v1`
 - API key: `local-opencode-token` if `LOCAL_AUTH_TOKEN` is set, otherwise any non-empty dummy value accepted by OpenCode

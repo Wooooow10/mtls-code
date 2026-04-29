@@ -1,4 +1,5 @@
 import http, { type ClientRequest, type IncomingMessage, type RequestOptions, type Server } from 'node:http';
+import https from 'node:https';
 import { type AddressInfo } from 'node:net';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
@@ -15,6 +16,7 @@ function configFor(upstreamBaseUrl: string, overrides: Partial<ProxyConfig> = {}
     clientCert: Buffer.from('cert'),
     clientKey: Buffer.from('key'),
     forwardAuthorization: false,
+    upstreamTlsVerify: true,
     upstreamTimeoutMs: 5000,
     ...overrides
   };
@@ -236,6 +238,42 @@ test('createProxyHandler maps upstream request timeouts to safe JSON responses',
     assert.equal(response.statusCode, 504);
     assert.equal(response.body, JSON.stringify({ error: { message: 'Upstream request timed out' } }));
     assert.equal(upstreamDestroyed, true);
+  } finally {
+    await close(proxy);
+  }
+});
+
+test('createProxyHandler disables upstream certificate verification when configured', async () => {
+  let upstreamAgent: https.Agent | undefined;
+  const failingRequest: RequestFunction = (options, _callback) => {
+    upstreamAgent = options.agent as https.Agent;
+
+    const req = new http.ClientRequest('http://127.0.0.1');
+    process.nextTick(() => {
+      const error = new Error('stop after capturing request options') as NodeJS.ErrnoException;
+      error.code = 'ECONNRESET';
+      req.emit('error', error);
+    });
+    return req;
+  };
+
+  const proxy = http.createServer(createProxyHandler(configFor('https://llm-provider.example.com', {
+    upstreamTlsVerify: false
+  }), {
+    request: failingRequest,
+    logger: () => undefined,
+    generateRequestId: () => 'req-tls-verify'
+  }));
+
+  const proxyPort = await listen(proxy);
+
+  try {
+    await requestLocal(proxyPort, {
+      method: 'GET',
+      path: '/v1/models'
+    });
+
+    assert.equal(upstreamAgent?.options.rejectUnauthorized, false);
   } finally {
     await close(proxy);
   }

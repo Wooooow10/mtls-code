@@ -9,6 +9,7 @@ export interface ProxyConfig {
   caCert?: Buffer;
   localAuthToken?: string;
   forwardAuthorization: boolean;
+  upstreamTlsVerify: boolean;
   upstreamTimeoutMs: number;
 }
 
@@ -34,6 +35,7 @@ export function loadConfig(env: Env = process.env, options: LoadConfigOptions = 
     caCert,
     localAuthToken: mergedEnv.LOCAL_AUTH_TOKEN || undefined,
     forwardAuthorization: parseBoolean(mergedEnv.FORWARD_AUTHORIZATION || 'false', 'FORWARD_AUTHORIZATION'),
+    upstreamTlsVerify: parseBoolean(mergedEnv.UPSTREAM_TLS_VERIFY || 'true', 'UPSTREAM_TLS_VERIFY'),
     upstreamTimeoutMs: parsePositiveInteger(mergedEnv.UPSTREAM_TIMEOUT_MS || '120000', 'UPSTREAM_TIMEOUT_MS')
   };
 }

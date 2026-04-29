@@ -48,7 +48,16 @@ Defaults:
 - `LISTEN_HOST=127.0.0.1`
 - `LISTEN_PORT=8787`
 - `FORWARD_AUTHORIZATION=false`
+- `UPSTREAM_TLS_VERIFY=true`
 - `UPSTREAM_TIMEOUT_MS=120000`
+
+If the upstream server presents a certificate that Node cannot verify and you cannot provide the correct CA bundle, you can temporarily disable upstream server certificate verification:
+
+```bash
+UPSTREAM_TLS_VERIFY=false
+```
+
+Use this only as a diagnostic or last-resort workaround. It disables verification of the upstream server certificate; it does not disable sending the configured client certificate and key.
 
 ## OpenCode Configuration
 
@@ -129,6 +138,8 @@ curl -H "Authorization: Bearer local-opencode-token" \
 
 Expected: JSON model response through the local proxy.
 
+If direct `curl` works only with `-k` or `--insecure`, fix `CA_CERT_PATH` when possible. `UPSTREAM_TLS_VERIFY=false` gives the proxy the same insecure behavior as `curl -k`.
+
 ## Verify Chat Completion
 
 ```bash
@@ -143,6 +154,7 @@ Expected: OpenAI-compatible chat completion response.
 ## Security Notes
 
 - The proxy binds to `127.0.0.1` by default.
+- Keep `UPSTREAM_TLS_VERIFY=true` in normal use. Setting it to `false` makes the proxy trust any upstream certificate.
 - The proxy does not forward OpenCode's local `Authorization` header upstream unless `FORWARD_AUTHORIZATION=true`.
 - Normal logs include request metadata only.
 - Do not commit real certificate, key, CA, or `.env` files.

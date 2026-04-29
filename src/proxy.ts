@@ -26,6 +26,7 @@ export function createProxyHandler(config: ProxyConfig, dependencies: ProxyDepen
         cert: config.clientCert,
         key: config.clientKey,
         ca: config.caCert,
+        rejectUnauthorized: config.upstreamTlsVerify,
         keepAlive: true
       })
     : undefined;

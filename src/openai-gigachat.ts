@@ -16,7 +16,7 @@ export interface OpenAiErrorBody {
       contentType: string | null;
       bodyBytes: number;
       bodyPreview?: string;
-    };
+    } | Record<string, unknown>;
   };
 }
 
@@ -36,6 +36,13 @@ export class TranslationBufferLimitError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'TranslationBufferLimitError';
+  }
+}
+
+export class TranslationResponseError extends Error {
+  constructor(public readonly statusCode: number, public readonly body: OpenAiErrorBody) {
+    super(body.error.message);
+    this.name = 'TranslationResponseError';
   }
 }
 
@@ -621,22 +628,75 @@ function translateChatChoice(choice: unknown, index: number, requestId: string, 
     };
   }
 
-  if (isRecord(sourceMessage.function_call)) {
-    message.tool_calls = [translateFunctionCallToToolCall(sourceMessage.function_call, requestId, index)];
+  const toolCalls = extractResponseToolCalls(source, sourceMessage, requestId, index);
+  if (toolCalls.length > 0) {
+    message.tool_calls = toolCalls;
+  } else if (source.finish_reason === 'function_call' || source.finish_reason === 'tool_calls') {
+    throw missingFunctionCallPayloadError(typeof source.index === 'number' ? source.index : index, source.finish_reason);
   }
 
   return {
     index: typeof source.index === 'number' ? source.index : index,
     message,
-    finish_reason: source.finish_reason === 'function_call' ? 'tool_calls' : source.finish_reason ?? null,
+    finish_reason: source.finish_reason === 'function_call' || source.finish_reason === 'tool_calls' ? 'tool_calls' : source.finish_reason ?? null,
     logprobs: null
   };
 }
 
-function translateFunctionCallToToolCall(functionCall: Record<string, unknown>, requestId: string, index: number): Record<string, unknown> {
+function extractResponseToolCalls(source: Record<string, unknown>, sourceMessage: Record<string, unknown>, requestId: string, index: number): Record<string, unknown>[] {
+  if (isValidFunctionCallPayload(sourceMessage.function_call)) {
+    return [translateFunctionCallToToolCall(sourceMessage.function_call, requestId, index)];
+  }
+
+  const messageToolCalls = translateToolCallArray(sourceMessage.tool_calls, requestId, index);
+  if (messageToolCalls.length > 0) {
+    return messageToolCalls;
+  }
+
+  if (isValidFunctionCallPayload(source.function_call)) {
+    return [translateFunctionCallToToolCall(source.function_call, requestId, index)];
+  }
+
+  return translateToolCallArray(source.tool_calls, requestId, index);
+}
+
+function translateToolCallArray(value: unknown, requestId: string, choiceIndex: number): Record<string, unknown>[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((toolCall, toolCallIndex) => {
+    if (!isRecord(toolCall) || (toolCall.type !== undefined && toolCall.type !== 'function') || !isValidFunctionCallPayload(toolCall.function)) {
+      return [];
+    }
+    const id = typeof toolCall.id === 'string' ? toolCall.id : `call_${requestId}_${choiceIndex}_${toolCallIndex}`;
+    return [translateFunctionCallToToolCall(toolCall.function, requestId, choiceIndex, id)];
+  });
+}
+
+function isValidFunctionCallPayload(value: unknown): value is Record<string, unknown> {
+  return isRecord(value) && typeof value.name === 'string' && value.name.trim().length > 0;
+}
+
+function missingFunctionCallPayloadError(choiceIndex: number, finishReason = 'function_call'): TranslationResponseError {
+  return new TranslationResponseError(502, {
+    error: {
+      message: 'Upstream response finished with function_call but did not include function call payload',
+      type: 'server_error',
+      param: null,
+      code: 'missing_upstream_function_call',
+      upstream: {
+        choiceIndex,
+        finishReason
+      }
+    }
+  });
+}
+
+function translateFunctionCallToToolCall(functionCall: Record<string, unknown>, requestId: string, index: number, id = `call_${requestId}_${index}`): Record<string, unknown> {
   const name = typeof functionCall.name === 'string' ? mapToolNameFromGigaChat(functionCall.name) : '';
   return {
-    id: `call_${requestId}_${index}`,
+    id,
     type: 'function',
     function: {
       name,

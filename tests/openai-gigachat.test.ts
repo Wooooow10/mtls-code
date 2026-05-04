@@ -375,6 +375,187 @@ test('openai-gigachat mode translates non-streaming function-call chat responses
   }
 });
 
+test('openai-gigachat mode rejects function-call finishes without function-call payloads', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      choices: [
+        {
+          index: 0,
+          message: { role: 'assistant', content: '' },
+          finish_reason: 'function_call'
+        }
+      ]
+    }));
+  });
+
+  const upstreamPort = await listen(upstream);
+  const proxy = http.createServer(createProxyHandler(configFor(`http://127.0.0.1:${upstreamPort}`), {
+    request: httpRequest as RequestFunction,
+    logger: () => undefined,
+    generateRequestId: () => 'req-missing-function-call'
+  }));
+
+  const proxyPort = await listen(proxy);
+
+  try {
+    const response = await requestLocal(proxyPort, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: { 'content-type': 'application/json' }
+    }, JSON.stringify({ model: 'tool-model', messages: [{ role: 'user', content: 'use a tool' }] }));
+
+    assert.equal(response.statusCode, 502);
+    assert.deepEqual(JSON.parse(response.body), {
+      error: {
+        message: 'Upstream response finished with function_call but did not include function call payload',
+        type: 'server_error',
+        param: null,
+        code: 'missing_upstream_function_call',
+        upstream: {
+          choiceIndex: 0,
+          finishReason: 'function_call'
+        }
+      }
+    });
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('openai-gigachat mode translates upstream message tool_calls before using tool_calls finish reason', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              { id: 'upstream-call', type: 'function', function: { name: '__gpt2giga_user_search_web', arguments: { query: 'cats' } } }
+            ]
+          },
+          finish_reason: 'function_call'
+        }
+      ]
+    }));
+  });
+
+  const upstreamPort = await listen(upstream);
+  const proxy = http.createServer(createProxyHandler(configFor(`http://127.0.0.1:${upstreamPort}`), {
+    request: httpRequest as RequestFunction,
+    logger: () => undefined,
+    generateRequestId: () => 'req-message-tool-calls'
+  }));
+
+  const proxyPort = await listen(proxy);
+
+  try {
+    const response = await requestLocal(proxyPort, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: { 'content-type': 'application/json' }
+    }, JSON.stringify({ model: 'tool-model', messages: [{ role: 'user', content: 'use a tool' }] }));
+
+    assert.equal(response.statusCode, 200);
+    const payload = JSON.parse(response.body);
+    assert.deepEqual(payload.choices[0].message.tool_calls, [
+      {
+        id: 'upstream-call',
+        type: 'function',
+        function: { name: 'web_search', arguments: '{"query":"cats"}' }
+      }
+    ]);
+    assert.equal(payload.choices[0].finish_reason, 'tool_calls');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('openai-gigachat mode translates choice-level upstream function_call payloads', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      choices: [
+        {
+          index: 0,
+          message: { role: 'assistant', content: '' },
+          function_call: { name: '__gpt2giga_user_search_web', arguments: { query: 'dogs' } },
+          finish_reason: 'function_call'
+        }
+      ]
+    }));
+  });
+
+  const upstreamPort = await listen(upstream);
+  const proxy = http.createServer(createProxyHandler(configFor(`http://127.0.0.1:${upstreamPort}`), {
+    request: httpRequest as RequestFunction,
+    logger: () => undefined,
+    generateRequestId: () => 'req-choice-function-call'
+  }));
+
+  const proxyPort = await listen(proxy);
+
+  try {
+    const response = await requestLocal(proxyPort, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: { 'content-type': 'application/json' }
+    }, JSON.stringify({ model: 'tool-model', messages: [{ role: 'user', content: 'use a tool' }] }));
+
+    assert.equal(response.statusCode, 200);
+    const payload = JSON.parse(response.body);
+    assert.equal(payload.choices[0].finish_reason, 'tool_calls');
+    assert.equal(payload.choices[0].message.tool_calls[0].function.name, 'web_search');
+    assert.equal(payload.choices[0].message.tool_calls[0].function.arguments, '{"query":"dogs"}');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('openai-gigachat mode rejects function-call finishes with invalid function-call payloads', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      choices: [
+        {
+          index: 0,
+          message: { role: 'assistant', content: '', function_call: { arguments: { query: 'cats' } } },
+          finish_reason: 'function_call'
+        }
+      ]
+    }));
+  });
+
+  const upstreamPort = await listen(upstream);
+  const proxy = http.createServer(createProxyHandler(configFor(`http://127.0.0.1:${upstreamPort}`), {
+    request: httpRequest as RequestFunction,
+    logger: () => undefined,
+    generateRequestId: () => 'req-invalid-function-call'
+  }));
+
+  const proxyPort = await listen(proxy);
+
+  try {
+    const response = await requestLocal(proxyPort, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: { 'content-type': 'application/json' }
+    }, JSON.stringify({ model: 'tool-model', messages: [{ role: 'user', content: 'use a tool' }] }));
+
+    assert.equal(response.statusCode, 502);
+    assert.equal(JSON.parse(response.body).error.code, 'missing_upstream_function_call');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test('openai-gigachat mode preserves upstream chat error status without translating it as success', async () => {
   const upstream = http.createServer((_req, res) => {
     res.writeHead(429, { 'content-type': 'application/json' });
@@ -874,6 +1055,43 @@ test('openai-gigachat mode preserves split streaming tool-call delta fields with
       function: { arguments: '{"query"' }
     });
     assert.equal(events[2], '[DONE]');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('openai-gigachat mode emits a streaming error for function-call finishes without prior tool-call deltas', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(`data: ${JSON.stringify({
+      choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }]
+    })}\n\n`);
+    res.end(`data: ${JSON.stringify({
+      choices: [{ index: 0, delta: {}, finish_reason: 'function_call' }]
+    })}\n\n`);
+  });
+
+  const upstreamPort = await listen(upstream);
+  const proxy = http.createServer(createProxyHandler(configFor(`http://127.0.0.1:${upstreamPort}`), {
+    request: httpRequest as RequestFunction,
+    logger: () => undefined,
+    generateRequestId: () => 'req-stream-missing-tool'
+  }));
+
+  const proxyPort = await listen(proxy);
+
+  try {
+    const response = await requestLocal(proxyPort, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: { 'content-type': 'application/json' }
+    }, JSON.stringify({ model: 'stream-model', stream: true, messages: [{ role: 'user', content: 'hi' }] }));
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.includes('"finish_reason":"tool_calls"'), false);
+    assert.equal(response.body.includes('missing_upstream_function_call'), true);
+    assert.equal(response.body.endsWith('data: [DONE]\n\n'), true);
   } finally {
     await close(proxy);
     await close(upstream);

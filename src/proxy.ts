@@ -18,6 +18,7 @@ import {
   translateModelResponse,
   translateModelsResponse,
   transformChatCompletionRequest,
+  TranslationResponseError,
   unsupportedEndpointError,
   type OpenAiErrorBody,
   type OpenAiGigaChatRoute
@@ -461,7 +462,17 @@ function handleTranslatedChatJsonResponse(params: {
       return;
     }
 
-    const translated = JSON.stringify(translateChatCompletionResponse(parsed, originalModel, requestId, { structuredOutputFunctionName }));
+    let translated: string;
+    try {
+      translated = JSON.stringify(translateChatCompletionResponse(parsed, originalModel, requestId, { structuredOutputFunctionName }));
+    } catch (error) {
+      if (error instanceof TranslationResponseError) {
+        sendOpenAiError(res, error.statusCode, error.body);
+        logger({ event: 'request_failed', requestId, method, path: logPath, statusCode: error.statusCode, reason: error.message, durationMs: Date.now() - startedAt });
+        return;
+      }
+      throw error;
+    }
     const headers = sanitizeTranslatedResponseHeaders(upstreamRes.headers, 'application/json');
     headers['content-length'] = Buffer.byteLength(translated).toString();
     res.writeHead(statusCode, headers);
@@ -495,6 +506,7 @@ function handleTranslatedChatSseResponse(params: {
 
   let buffer = '';
   let done = false;
+  const streamChoicesWithToolCallDeltas = new Set<number>();
 
   const ensureSseHeaders = () => {
     if (!res.headersSent) {
@@ -514,6 +526,22 @@ function handleTranslatedChatSseResponse(params: {
     if (!done) {
       ensureSseHeaders();
       res.write(`data: ${JSON.stringify(openAiError(message, 'server_error', 'upstream_stream_error'))}\n\n`);
+      emitDone();
+    }
+  };
+
+  const emitMissingFunctionCallPayloadError = (choiceIndex: number, finishReason: string) => {
+    if (!done) {
+      ensureSseHeaders();
+      res.write(`data: ${JSON.stringify({
+        error: {
+          message: 'Upstream stream finished with function_call but did not include function call payload',
+          type: 'server_error',
+          param: null,
+          code: 'missing_upstream_function_call',
+          upstream: { choiceIndex, finishReason }
+        }
+      })}\n\n`);
       emitDone();
     }
   };
@@ -557,6 +585,12 @@ function handleTranslatedChatSseResponse(params: {
 
     try {
       const parsed = JSON.parse(data) as unknown;
+      const missingFunctionCall = findStreamingFunctionCallFinishWithoutPayload(parsed, streamChoicesWithToolCallDeltas);
+      if (missingFunctionCall) {
+        emitMissingFunctionCallPayloadError(missingFunctionCall.choiceIndex, missingFunctionCall.finishReason);
+        return;
+      }
+      rememberStreamingFunctionCallDeltas(parsed, streamChoicesWithToolCallDeltas);
       ensureSseHeaders();
       res.write(`data: ${JSON.stringify(translateChatCompletionStreamChunk(parsed, originalModel, requestId))}\n\n`);
     } catch {
@@ -624,6 +658,46 @@ function nextSseEventBoundary(buffer: string): { index: number; length: number }
     return { index: lfIndex, length: 2 };
   }
   return { index: crlfIndex, length: 4 };
+}
+
+function findStreamingFunctionCallFinishWithoutPayload(data: unknown, seenToolCallDeltas: Set<number>): { choiceIndex: number; finishReason: string } | undefined {
+  if (!isRecord(data) || !Array.isArray(data.choices)) {
+    return undefined;
+  }
+
+  for (const [fallbackIndex, choice] of data.choices.entries()) {
+    if (!isRecord(choice) || (choice.finish_reason !== 'function_call' && choice.finish_reason !== 'tool_calls')) {
+      continue;
+    }
+
+    const choiceIndex = typeof choice.index === 'number' ? choice.index : fallbackIndex;
+    if (!choiceHasStreamingFunctionCallDelta(choice) && !seenToolCallDeltas.has(choiceIndex)) {
+      return { choiceIndex, finishReason: choice.finish_reason };
+    }
+  }
+
+  return undefined;
+}
+
+function rememberStreamingFunctionCallDeltas(data: unknown, seenToolCallDeltas: Set<number>): void {
+  if (!isRecord(data) || !Array.isArray(data.choices)) {
+    return;
+  }
+
+  for (const [fallbackIndex, choice] of data.choices.entries()) {
+    if (!isRecord(choice) || !choiceHasStreamingFunctionCallDelta(choice)) {
+      continue;
+    }
+    seenToolCallDeltas.add(typeof choice.index === 'number' ? choice.index : fallbackIndex);
+  }
+}
+
+function choiceHasStreamingFunctionCallDelta(choice: Record<string, unknown>): boolean {
+  return isRecord(choice.delta) && isRecord(choice.delta.function_call);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function sendJson(res: ServerResponse, statusCode: number, message: string): void {

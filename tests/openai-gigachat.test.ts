@@ -916,16 +916,25 @@ test('openai-gigachat mode wraps non-object tool result content in JSON object s
 });
 
 test('openai-gigachat mode translates streaming chat SSE chunks and tool-call deltas', async () => {
-  const upstream = http.createServer((_req, res) => {
-    res.writeHead(200, { 'content-type': 'text/event-stream' });
-    res.write(`data: ${JSON.stringify({
-      choices: [{ index: 0, delta: { role: 'assistant', content: 'hel' }, finish_reason: null }],
-      usage: { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1, precached_prompt_tokens: 1 }
-    })}\n\n`);
-    res.write(`data: ${JSON.stringify({
-      choices: [{ index: 0, delta: { function_call: { name: '__gpt2giga_user_search_web', arguments: { query: 'cats' } } }, finish_reason: 'function_call' }]
-    })}\n\n`);
-    res.end('data: [DONE]\n\n');
+  let upstreamBody: Record<string, unknown> | undefined;
+  const upstream = http.createServer((req, res) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      upstreamBody = JSON.parse(body);
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(`data: ${JSON.stringify({
+        choices: [{ index: 0, delta: { role: 'assistant', content: 'hel' }, finish_reason: null }],
+        usage: { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1, precached_prompt_tokens: 1 }
+      })}\n\n`);
+      res.write(`data: ${JSON.stringify({
+        choices: [{ index: 0, delta: { function_call: { name: '__gpt2giga_user_search_web', arguments: { query: 'cats' } } }, finish_reason: 'function_call' }]
+      })}\n\n`);
+      res.end('data: [DONE]\n\n');
+    });
   });
 
   const upstreamPort = await listen(upstream);
@@ -945,6 +954,7 @@ test('openai-gigachat mode translates streaming chat SSE chunks and tool-call de
     }, JSON.stringify({ model: 'stream-model', stream: true, messages: [{ role: 'user', content: 'hi' }] }));
 
     assert.equal(response.statusCode, 200);
+    assert.equal(upstreamBody?.stream, true);
     assert.equal(response.headers['content-type'], 'text/event-stream');
     const events = response.body.trimEnd().split('\n\n').map((event) => event.replace(/^data: /, ''));
     assert.deepEqual(events.map((event) => event === '[DONE]' ? event : JSON.parse(event)).map((event) => {
@@ -1007,6 +1017,153 @@ test('openai-gigachat mode translates streaming chat SSE chunks and tool-call de
   }
 });
 
+test('openai-gigachat mode sends tool-capable streaming requests upstream as non-streaming and returns SSE tool calls', async () => {
+  let upstreamBody: Record<string, unknown> | undefined;
+  const upstream = http.createServer((req, res) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      upstreamBody = JSON.parse(body);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: '',
+              function_call: { name: '__gpt2giga_user_search_web', arguments: { query: 'cats' } }
+            },
+            finish_reason: 'function_call'
+          }
+        ]
+      }));
+    });
+  });
+
+  const upstreamPort = await listen(upstream);
+  const proxy = http.createServer(createProxyHandler(configFor(`http://127.0.0.1:${upstreamPort}`), {
+    request: httpRequest as RequestFunction,
+    logger: () => undefined,
+    generateRequestId: () => 'req-tool-stream-fallback'
+  }));
+
+  const proxyPort = await listen(proxy);
+
+  try {
+    const response = await requestLocal(proxyPort, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: { 'content-type': 'application/json' }
+    }, JSON.stringify({
+      model: 'GLM-5.1',
+      stream: true,
+      stream_options: { include_usage: true },
+      tool_choice: 'auto',
+      tools: [{ type: 'function', function: { name: 'web_search', parameters: { type: 'object' } } }],
+      messages: [{ role: 'user', content: 'search' }]
+    }));
+
+    assert.equal(response.statusCode, 200);
+    assert.ok(upstreamBody);
+    assert.equal(upstreamBody.stream, undefined);
+    assert.equal(upstreamBody.stream_options, undefined);
+    assert.equal(Array.isArray(upstreamBody.functions), true);
+    assert.equal(response.headers['content-type'], 'text/event-stream');
+    const events = response.body.trimEnd().split('\n\n').map((event) => event.replace(/^data: /, ''));
+    const chunk = JSON.parse(events[0]);
+    chunk.created = 0;
+    chunk.choices[0].delta.tool_calls[0].id = 'call_normalized';
+    assert.deepEqual(chunk, {
+      id: 'chatcmpl-req-tool-stream-fallback',
+      object: 'chat.completion.chunk',
+      created: 0,
+      model: 'GLM-5.1',
+      choices: [
+        {
+          index: 0,
+          delta: {
+            role: 'assistant',
+            tool_calls: [
+              {
+                index: 0,
+                id: 'call_normalized',
+                type: 'function',
+                function: { name: 'web_search', arguments: '{"query":"cats"}' }
+              }
+            ]
+          },
+          finish_reason: 'tool_calls',
+          logprobs: null
+        }
+      ],
+      usage: null,
+      system_fingerprint: 'fp_req-tool-stream-fallback'
+    });
+    assert.equal(events[1], '[DONE]');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('openai-gigachat mode streams fallback text responses for tool-capable streaming requests', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      choices: [
+        { index: 0, message: { role: 'assistant', content: 'plain answer' }, finish_reason: 'stop' }
+      ]
+    }));
+  });
+
+  const upstreamPort = await listen(upstream);
+  const proxy = http.createServer(createProxyHandler(configFor(`http://127.0.0.1:${upstreamPort}`), {
+    request: httpRequest as RequestFunction,
+    logger: () => undefined,
+    generateRequestId: () => 'req-tool-stream-text-fallback'
+  }));
+
+  const proxyPort = await listen(proxy);
+
+  try {
+    const response = await requestLocal(proxyPort, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: { 'content-type': 'application/json' }
+    }, JSON.stringify({
+      model: 'GLM-5.1',
+      stream: true,
+      tools: [{ type: 'function', function: { name: 'lookup', parameters: { type: 'object' } } }],
+      messages: [{ role: 'user', content: 'answer without a tool' }]
+    }));
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.headers['content-type'], 'text/event-stream');
+    const events = response.body.trimEnd().split('\n\n').map((event) => event.replace(/^data: /, ''));
+    const chunk = JSON.parse(events[0]);
+    chunk.created = 0;
+    assert.deepEqual(chunk, {
+      id: 'chatcmpl-req-tool-stream-text-fallback',
+      object: 'chat.completion.chunk',
+      created: 0,
+      model: 'GLM-5.1',
+      choices: [
+        { index: 0, delta: { role: 'assistant', content: 'plain answer' }, finish_reason: 'stop', logprobs: null }
+      ],
+      usage: null,
+      system_fingerprint: 'fp_req-tool-stream-text-fallback'
+    });
+    assert.equal(events[1], '[DONE]');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test('openai-gigachat mode preserves split streaming tool-call delta fields without fake arguments', async () => {
   const upstream = http.createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -1055,6 +1212,115 @@ test('openai-gigachat mode preserves split streaming tool-call delta fields with
       function: { arguments: '{"query"' }
     });
     assert.equal(events[2], '[DONE]');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('openai-gigachat mode translates alternate streaming message function-call payloads', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(`data: ${JSON.stringify({
+      choices: [
+        {
+          index: 0,
+          message: { function_call: { name: '__gpt2giga_user_search_web', arguments: { query: 'birds' } } },
+          finish_reason: 'function_call'
+        }
+      ]
+    })}\n\n`);
+    res.end('data: [DONE]\n\n');
+  });
+
+  const upstreamPort = await listen(upstream);
+  const proxy = http.createServer(createProxyHandler(configFor(`http://127.0.0.1:${upstreamPort}`), {
+    request: httpRequest as RequestFunction,
+    logger: () => undefined,
+    generateRequestId: () => 'req-stream-message-function'
+  }));
+
+  const proxyPort = await listen(proxy);
+
+  try {
+    const response = await requestLocal(proxyPort, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: { 'content-type': 'application/json' }
+    }, JSON.stringify({ model: 'stream-model', stream: true, messages: [{ role: 'user', content: 'hi' }] }));
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.includes('missing_upstream_function_call'), false);
+    const events = response.body.trimEnd().split('\n\n').map((event) => event.replace(/^data: /, ''));
+    const first = JSON.parse(events[0]);
+    first.choices[0].delta.tool_calls[0].id = 'call_normalized';
+    assert.deepEqual(first.choices[0], {
+      index: 0,
+      delta: {
+        tool_calls: [
+          {
+            index: 0,
+            id: 'call_normalized',
+            type: 'function',
+            function: { name: 'web_search', arguments: '{"query":"birds"}' }
+          }
+        ]
+      },
+      finish_reason: 'tool_calls',
+      logprobs: null
+    });
+    assert.equal(events[1], '[DONE]');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('openai-gigachat mode translates alternate streaming choice-level tool_calls payloads', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(`data: ${JSON.stringify({
+      choices: [
+        {
+          index: 0,
+          tool_calls: [
+            { id: 'choice-tool-call', type: 'function', function: { name: '__gpt2giga_user_search_web', arguments: { query: 'fish' } } }
+          ],
+          finish_reason: 'function_call'
+        }
+      ]
+    })}\n\n`);
+    res.end('data: [DONE]\n\n');
+  });
+
+  const upstreamPort = await listen(upstream);
+  const proxy = http.createServer(createProxyHandler(configFor(`http://127.0.0.1:${upstreamPort}`), {
+    request: httpRequest as RequestFunction,
+    logger: () => undefined,
+    generateRequestId: () => 'req-stream-choice-tools'
+  }));
+
+  const proxyPort = await listen(proxy);
+
+  try {
+    const response = await requestLocal(proxyPort, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: { 'content-type': 'application/json' }
+    }, JSON.stringify({ model: 'stream-model', stream: true, messages: [{ role: 'user', content: 'hi' }] }));
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.includes('missing_upstream_function_call'), false);
+    const events = response.body.trimEnd().split('\n\n').map((event) => event.replace(/^data: /, ''));
+    const first = JSON.parse(events[0]);
+    assert.deepEqual(first.choices[0].delta.tool_calls[0], {
+      index: 0,
+      id: 'choice-tool-call',
+      type: 'function',
+      function: { name: 'web_search', arguments: '{"query":"fish"}' }
+    });
+    assert.equal(first.choices[0].finish_reason, 'tool_calls');
+    assert.equal(events[1], '[DONE]');
   } finally {
     await close(proxy);
     await close(upstream);

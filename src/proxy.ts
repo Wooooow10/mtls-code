@@ -14,6 +14,7 @@ import {
   TRANSLATED_SSE_EVENT_LIMIT_BYTES,
   TRANSLATED_UPSTREAM_BODY_LIMIT_BYTES,
   translateChatCompletionResponse,
+  translateChatCompletionToStreamChunks,
   translateChatCompletionStreamChunk,
   translateModelResponse,
   translateModelsResponse,
@@ -190,7 +191,7 @@ async function handleOpenAiGigaChatRequest(params: {
   delete headers['content-length'];
 
   let body: string | undefined;
-  let chatResponseContext: { originalModel: string; stream: boolean; structuredOutputFunctionName?: string } | undefined;
+  let chatResponseContext: { originalModel: string; stream: boolean; upstreamStream: boolean; structuredOutputFunctionName?: string } | undefined;
 
   if (route.kind === 'chat') {
     let rawBody: string;
@@ -223,8 +224,14 @@ async function handleOpenAiGigaChatRequest(params: {
       return;
     }
 
+    const upstreamStream = transformed.stream && !isToolCapableTranslatedChatRequest(transformed.body);
+    if (transformed.stream && !upstreamStream) {
+      delete transformed.body.stream;
+      delete transformed.body.stream_options;
+    }
+
     body = JSON.stringify(transformed.body);
-    chatResponseContext = { originalModel: transformed.originalModel, stream: transformed.stream, structuredOutputFunctionName: transformed.structuredOutputFunctionName };
+    chatResponseContext = { originalModel: transformed.originalModel, stream: transformed.stream, upstreamStream, structuredOutputFunctionName: transformed.structuredOutputFunctionName };
     headers['content-type'] = 'application/json';
     headers['content-length'] = Buffer.byteLength(body).toString();
   }
@@ -274,15 +281,15 @@ async function handleOpenAiGigaChatRequest(params: {
   try {
     upstreamReq = request(options, (upstreamRes) => {
       const statusCode = upstreamRes.statusCode || 502;
-      if (route.kind === 'chat' && chatResponseContext && !chatResponseContext.stream) {
+      if (route.kind === 'chat' && chatResponseContext && !chatResponseContext.upstreamStream) {
+        handleTranslatedChatJsonResponse({ upstreamRes, res, statusCode, requestId, originalModel: chatResponseContext.originalModel, structuredOutputFunctionName: chatResponseContext.structuredOutputFunctionName, emitAsSse: chatResponseContext.stream && statusCode < 400, logger, method: req.method, logPath, startedAt, markUpstreamEnded: () => { upstreamEnded = true; } });
+        return;
+      }
+      if (route.kind === 'chat' && chatResponseContext?.upstreamStream && statusCode >= 400) {
         handleTranslatedChatJsonResponse({ upstreamRes, res, statusCode, requestId, originalModel: chatResponseContext.originalModel, structuredOutputFunctionName: chatResponseContext.structuredOutputFunctionName, logger, method: req.method, logPath, startedAt, markUpstreamEnded: () => { upstreamEnded = true; } });
         return;
       }
-      if (route.kind === 'chat' && chatResponseContext?.stream && statusCode >= 400) {
-        handleTranslatedChatJsonResponse({ upstreamRes, res, statusCode, requestId, originalModel: chatResponseContext.originalModel, structuredOutputFunctionName: chatResponseContext.structuredOutputFunctionName, logger, method: req.method, logPath, startedAt, markUpstreamEnded: () => { upstreamEnded = true; } });
-        return;
-      }
-      if (route.kind === 'chat' && chatResponseContext?.stream) {
+      if (route.kind === 'chat' && chatResponseContext?.upstreamStream) {
         handleTranslatedChatSseResponse({ upstreamRes, res, statusCode, requestId, originalModel: chatResponseContext.originalModel, logger, method: req.method, logPath, startedAt, markUpstreamEnded: () => { upstreamEnded = true; } });
         return;
       }
@@ -413,13 +420,14 @@ function handleTranslatedChatJsonResponse(params: {
   requestId: string;
   originalModel: string;
   structuredOutputFunctionName?: string;
+  emitAsSse?: boolean;
   logger: (entry: Record<string, unknown>) => void;
   method: string | undefined;
   logPath: string;
   startedAt: number;
   markUpstreamEnded: () => void;
 }): void {
-  const { upstreamRes, res, statusCode, requestId, originalModel, structuredOutputFunctionName, logger, method, logPath, startedAt, markUpstreamEnded } = params;
+  const { upstreamRes, res, statusCode, requestId, originalModel, structuredOutputFunctionName, emitAsSse, logger, method, logPath, startedAt, markUpstreamEnded } = params;
   let body = '';
   let bytes = 0;
   let overLimit = false;
@@ -462,9 +470,9 @@ function handleTranslatedChatJsonResponse(params: {
       return;
     }
 
-    let translated: string;
+    let translatedCompletion: Record<string, unknown>;
     try {
-      translated = JSON.stringify(translateChatCompletionResponse(parsed, originalModel, requestId, { structuredOutputFunctionName }));
+      translatedCompletion = translateChatCompletionResponse(parsed, originalModel, requestId, { structuredOutputFunctionName });
     } catch (error) {
       if (error instanceof TranslationResponseError) {
         sendOpenAiError(res, error.statusCode, error.body);
@@ -473,6 +481,20 @@ function handleTranslatedChatJsonResponse(params: {
       }
       throw error;
     }
+
+    if (emitAsSse) {
+      const headers = sanitizeTranslatedResponseHeaders(upstreamRes.headers, 'text/event-stream');
+      res.writeHead(statusCode, headers);
+      for (const chunk of translateChatCompletionToStreamChunks(translatedCompletion)) {
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      }
+      res.write('data: [DONE]\n\n');
+      res.end();
+      logger({ event: 'request_complete', requestId, method, path: logPath, upstreamStatusCode: statusCode, durationMs: Date.now() - startedAt });
+      return;
+    }
+
+    const translated = JSON.stringify(translatedCompletion);
     const headers = sanitizeTranslatedResponseHeaders(upstreamRes.headers, 'application/json');
     headers['content-length'] = Buffer.byteLength(translated).toString();
     res.writeHead(statusCode, headers);
@@ -660,6 +682,10 @@ function nextSseEventBoundary(buffer: string): { index: number; length: number }
   return { index: crlfIndex, length: 4 };
 }
 
+function isToolCapableTranslatedChatRequest(body: Record<string, unknown>): boolean {
+  return (Array.isArray(body.functions) && body.functions.length > 0) || isRecord(body.function_call);
+}
+
 function findStreamingFunctionCallFinishWithoutPayload(data: unknown, seenToolCallDeltas: Set<number>): { choiceIndex: number; finishReason: string } | undefined {
   if (!isRecord(data) || !Array.isArray(data.choices)) {
     return undefined;
@@ -693,7 +719,27 @@ function rememberStreamingFunctionCallDeltas(data: unknown, seenToolCallDeltas: 
 }
 
 function choiceHasStreamingFunctionCallDelta(choice: Record<string, unknown>): boolean {
-  return isRecord(choice.delta) && isRecord(choice.delta.function_call);
+  const delta = isRecord(choice.delta) ? choice.delta : {};
+  const message = isRecord(choice.message) ? choice.message : {};
+  return isFunctionCallDeltaPayload(delta.function_call)
+    || hasFunctionCallDeltaArray(delta.tool_calls)
+    || isFunctionCallDeltaPayload(choice.function_call)
+    || hasFunctionCallDeltaArray(choice.tool_calls)
+    || isFunctionCallDeltaPayload(message.function_call)
+    || hasFunctionCallDeltaArray(message.tool_calls);
+}
+
+function hasFunctionCallDeltaArray(value: unknown): boolean {
+  return Array.isArray(value)
+    && value.some((toolCall) => isRecord(toolCall)
+      && (toolCall.type === undefined || toolCall.type === 'function')
+      && isFunctionCallDeltaPayload(toolCall.function));
+}
+
+function isFunctionCallDeltaPayload(value: unknown): value is Record<string, unknown> {
+  return isRecord(value)
+    && ((typeof value.name === 'string' && value.name.trim().length > 0)
+      || Object.prototype.hasOwnProperty.call(value, 'arguments'));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

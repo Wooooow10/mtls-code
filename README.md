@@ -78,6 +78,8 @@ In this mode chat requests are sent upstream as GigaChat `/chat/completions` JSO
 
 `tool_choice` is converted when it names a specific function. String choices `auto` and `required` are removed while leaving converted functions available; `none` is removed and converted functions are not forwarded.
 
+For raw HTTP compatibility, streaming chat requests that include converted GigaChat `functions` or a forced `function_call` are sent upstream as non-streaming requests and converted back to OpenAI SSE downstream. This avoids raw streaming responses that finish with function-call semantics but omit usable tool-call payloads.
+
 For MVP safety, translated request bodies, non-streaming upstream response bodies, and individual upstream SSE events are each buffered up to 1 MiB. Larger translated requests return `413`; larger upstream buffers return safe `502` errors.
 
 If a translated non-streaming chat or models response cannot be parsed as JSON, the OpenAI-style error includes safe upstream diagnostics under `error.upstream`: HTTP status, content type, body byte length, and a short sanitized body preview when text-like. Non-JSON upstream error statuses such as `401` or `429` are preserved instead of being rewritten to `502`.

@@ -201,6 +201,21 @@ export function translateChatCompletionStreamChunk(data: unknown, originalModel:
   };
 }
 
+export function translateChatCompletionToStreamChunks(completion: Record<string, unknown>): Record<string, unknown>[] {
+  const choices = Array.isArray(completion.choices) ? completion.choices : [];
+  return [
+    {
+      id: completion.id,
+      object: 'chat.completion.chunk',
+      created: completion.created,
+      model: completion.model,
+      choices: choices.map((choice, index) => translateCompletionChoiceToStreamChoice(choice, index)),
+      usage: completion.usage ?? null,
+      system_fingerprint: completion.system_fingerprint
+    }
+  ];
+}
+
 export function translateModelsResponse(data: unknown, created = Math.floor(Date.now() / 1000)): Record<string, unknown> {
   const models = extractModelList(data);
   return {
@@ -716,8 +731,9 @@ function translateChatStreamChoice(choice: unknown, index: number, requestId: st
   if ('content' in sourceDelta) {
     delta.content = sourceDelta.content;
   }
-  if (isRecord(sourceDelta.function_call)) {
-    delta.tool_calls = [translateFunctionCallDeltaToToolCall(sourceDelta.function_call, requestId, index)];
+  const toolCalls = extractStreamingToolCalls(source, sourceDelta, requestId, index);
+  if (toolCalls.length > 0) {
+    delta.tool_calls = toolCalls;
   }
 
   return {
@@ -726,6 +742,83 @@ function translateChatStreamChoice(choice: unknown, index: number, requestId: st
     finish_reason: source.finish_reason === 'function_call' ? 'tool_calls' : source.finish_reason ?? null,
     logprobs: null
   };
+}
+
+function translateCompletionChoiceToStreamChoice(choice: unknown, index: number): Record<string, unknown> {
+  const source = isRecord(choice) ? choice : {};
+  const message = isRecord(source.message) ? source.message : {};
+  const delta: Record<string, unknown> = {};
+
+  if (typeof message.role === 'string') {
+    delta.role = message.role;
+  }
+  if (typeof message.content === 'string' && message.content.length > 0) {
+    delta.content = message.content;
+  }
+  if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+    delta.tool_calls = message.tool_calls.map((toolCall, toolCallIndex) => ({
+      ...(isRecord(toolCall) ? toolCall : {}),
+      index: toolCallIndex
+    }));
+  }
+
+  return {
+    index: typeof source.index === 'number' ? source.index : index,
+    delta,
+    finish_reason: source.finish_reason ?? null,
+    logprobs: null
+  };
+}
+
+function extractStreamingToolCalls(source: Record<string, unknown>, sourceDelta: Record<string, unknown>, requestId: string, index: number): Record<string, unknown>[] {
+  if (isFunctionCallDeltaPayload(sourceDelta.function_call)) {
+    return [translateFunctionCallDeltaToToolCall(sourceDelta.function_call, requestId, index)];
+  }
+
+  const deltaToolCalls = translateToolCallDeltaArray(sourceDelta.tool_calls, requestId, index);
+  if (deltaToolCalls.length > 0) {
+    return deltaToolCalls;
+  }
+
+  if (isFunctionCallDeltaPayload(source.function_call)) {
+    return [translateFunctionCallDeltaToToolCall(source.function_call, requestId, index)];
+  }
+
+  const choiceToolCalls = translateToolCallDeltaArray(source.tool_calls, requestId, index);
+  if (choiceToolCalls.length > 0) {
+    return choiceToolCalls;
+  }
+
+  const sourceMessage = isRecord(source.message) ? source.message : {};
+  if (isFunctionCallDeltaPayload(sourceMessage.function_call)) {
+    return [translateFunctionCallDeltaToToolCall(sourceMessage.function_call, requestId, index)];
+  }
+
+  return translateToolCallDeltaArray(sourceMessage.tool_calls, requestId, index);
+}
+
+function translateToolCallDeltaArray(value: unknown, requestId: string, choiceIndex: number): Record<string, unknown>[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((toolCall, toolCallIndex) => {
+    if (!isRecord(toolCall) || (toolCall.type !== undefined && toolCall.type !== 'function') || !isFunctionCallDeltaPayload(toolCall.function)) {
+      return [];
+    }
+    const translated = translateFunctionCallDeltaToToolCall(toolCall.function, requestId, choiceIndex);
+    translated.index = typeof toolCall.index === 'number' ? toolCall.index : toolCallIndex;
+    if (typeof toolCall.id === 'string') {
+      translated.id = toolCall.id;
+    }
+    return [translated];
+  });
+}
+
+function isFunctionCallDeltaPayload(value: unknown): value is Record<string, unknown> {
+  return isRecord(value)
+    && ((typeof value.name === 'string' && value.name.trim().length > 0)
+      || Object.prototype.hasOwnProperty.call(value, 'arguments'));
 }
 
 function translateFunctionCallDeltaToToolCall(functionCall: Record<string, unknown>, requestId: string, index: number): Record<string, unknown> {

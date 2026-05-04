@@ -80,6 +80,8 @@ In this mode chat requests are sent upstream as GigaChat `/chat/completions` JSO
 
 For MVP safety, translated request bodies, non-streaming upstream response bodies, and individual upstream SSE events are each buffered up to 1 MiB. Larger translated requests return `413`; larger upstream buffers return safe `502` errors.
 
+If a translated non-streaming chat or models response cannot be parsed as JSON, the OpenAI-style error includes safe upstream diagnostics under `error.upstream`: HTTP status, content type, body byte length, and a short sanitized body preview when text-like. Non-JSON upstream error statuses such as `401` or `429` are preserved instead of being rewritten to `502`.
+
 Deferred from this MVP: Responses API, embeddings, files, batches, and image/file attachment uploads in chat messages.
 
 ## OpenCode Configuration

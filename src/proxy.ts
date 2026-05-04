@@ -374,8 +374,11 @@ function handleTranslatedJsonResponse(params: {
     try {
       parsed = JSON.parse(body);
     } catch {
-      sendOpenAiError(res, 502, openAiError('Malformed upstream JSON response', 'server_error', 'malformed_upstream_response'));
-      logger({ event: 'request_failed', requestId, method, path: logPath, statusCode: 502, reason: 'Malformed upstream JSON response', durationMs: Date.now() - startedAt });
+      const diagnostics = buildUpstreamDiagnostics(statusCode, upstreamRes.headers, body);
+      const downstreamStatusCode = statusCode >= 400 ? statusCode : 502;
+      const reason = statusCode >= 400 ? 'Upstream returned non-JSON error response' : 'Malformed upstream JSON response';
+      sendOpenAiError(res, downstreamStatusCode, statusCode >= 400 ? upstreamNonJsonError(statusCode, diagnostics) : malformedUpstreamJsonError(diagnostics));
+      logger({ event: 'request_failed', requestId, method, path: logPath, statusCode: downstreamStatusCode, reason, ...upstreamDiagnosticLogFields(diagnostics), durationMs: Date.now() - startedAt });
       return;
     }
 
@@ -444,8 +447,11 @@ function handleTranslatedChatJsonResponse(params: {
     try {
       parsed = JSON.parse(body);
     } catch {
-      sendOpenAiError(res, 502, openAiError('Malformed upstream JSON response', 'server_error', 'malformed_upstream_response'));
-      logger({ event: 'request_failed', requestId, method, path: logPath, statusCode: 502, reason: 'Malformed upstream JSON response', durationMs: Date.now() - startedAt });
+      const diagnostics = buildUpstreamDiagnostics(statusCode, upstreamRes.headers, body);
+      const downstreamStatusCode = statusCode >= 400 ? statusCode : 502;
+      const reason = statusCode >= 400 ? 'Upstream returned non-JSON error response' : 'Malformed upstream JSON response';
+      sendOpenAiError(res, downstreamStatusCode, statusCode >= 400 ? upstreamNonJsonError(statusCode, diagnostics) : malformedUpstreamJsonError(diagnostics));
+      logger({ event: 'request_failed', requestId, method, path: logPath, statusCode: downstreamStatusCode, reason, ...upstreamDiagnosticLogFields(diagnostics), durationMs: Date.now() - startedAt });
       return;
     }
 
@@ -628,6 +634,110 @@ function sendJson(res: ServerResponse, statusCode: number, message: string): voi
 function sendOpenAiError(res: ServerResponse, statusCode: number, body: OpenAiErrorBody): void {
   res.writeHead(statusCode, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
+}
+
+interface UpstreamDiagnostics {
+  statusCode: number;
+  contentType: string | null;
+  bodyBytes: number;
+  bodyPreview?: string;
+}
+
+function malformedUpstreamJsonError(upstream: UpstreamDiagnostics): OpenAiErrorBody {
+  return {
+    error: {
+      message: 'Malformed upstream JSON response',
+      type: 'server_error',
+      param: null,
+      code: 'malformed_upstream_response',
+      upstream
+    }
+  };
+}
+
+function upstreamNonJsonError(statusCode: number, upstream: UpstreamDiagnostics): OpenAiErrorBody {
+  return {
+    error: {
+      message: 'Upstream returned non-JSON error response',
+      type: defaultOpenAiErrorType(statusCode),
+      param: null,
+      code: 'upstream_non_json_error',
+      upstream
+    }
+  };
+}
+
+function defaultOpenAiErrorType(statusCode: number): string {
+  if (statusCode === 401) {
+    return 'authentication_error';
+  }
+  if (statusCode === 403) {
+    return 'permission_denied_error';
+  }
+  if (statusCode === 404) {
+    return 'not_found_error';
+  }
+  if (statusCode === 429) {
+    return 'rate_limit_error';
+  }
+  if (statusCode >= 500) {
+    return 'server_error';
+  }
+  return 'invalid_request_error';
+}
+
+function buildUpstreamDiagnostics(statusCode: number, headers: IncomingMessage['headers'], body: string): UpstreamDiagnostics {
+  const contentTypeHeader = headers['content-type'];
+  const contentType = Array.isArray(contentTypeHeader) ? contentTypeHeader.join(', ') : contentTypeHeader ?? null;
+  const diagnostics: UpstreamDiagnostics = {
+    statusCode,
+    contentType,
+    bodyBytes: Buffer.byteLength(body)
+  };
+  const preview = buildSafeBodyPreview(body, contentType);
+  if (preview !== undefined) {
+    diagnostics.bodyPreview = preview;
+  }
+  return diagnostics;
+}
+
+function buildSafeBodyPreview(body: string, contentType: string | null): string | undefined {
+  if (body.length === 0) {
+    return '';
+  }
+
+  const lowerContentType = (contentType || '').toLowerCase();
+  const textLikeContentType = lowerContentType.startsWith('text/')
+    || lowerContentType.includes('json')
+    || lowerContentType.includes('xml')
+    || lowerContentType.includes('html')
+    || lowerContentType.includes('javascript');
+
+  if (!textLikeContentType && hasManyControlCharacters(body)) {
+    return undefined;
+  }
+
+  return body
+    .slice(0, 200)
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ');
+}
+
+function hasManyControlCharacters(value: string): boolean {
+  if (value.length === 0) {
+    return false;
+  }
+
+  const controlCharacters = value.match(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g)?.length ?? 0;
+  return controlCharacters / value.length > 0.1;
+}
+
+function upstreamDiagnosticLogFields(upstream: UpstreamDiagnostics): Record<string, unknown> {
+  return {
+    upstreamStatusCode: upstream.statusCode,
+    upstreamContentType: upstream.contentType,
+    upstreamBodyBytes: upstream.bodyBytes,
+    ...(upstream.bodyPreview !== undefined ? { upstreamBodyPreview: upstream.bodyPreview } : {})
+  };
 }
 
 function sanitizeTranslatedResponseHeaders(headers: IncomingMessage['headers'], contentType: string): ReturnType<typeof sanitizeResponseHeaders> {

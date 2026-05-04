@@ -11,6 +11,12 @@ export interface OpenAiErrorBody {
     type: string;
     param: null;
     code: string | null;
+    upstream?: {
+      statusCode: number;
+      contentType: string | null;
+      bodyBytes: number;
+      bodyPreview?: string;
+    };
   };
 }
 

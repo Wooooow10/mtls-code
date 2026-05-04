@@ -947,6 +947,96 @@ test('openai-gigachat mode preserves upstream models error status without return
   }
 });
 
+test('openai-gigachat mode preserves upstream status for non-JSON 401 and 429 errors', async () => {
+  const cases = [
+    { upstreamStatusCode: 401, expectedType: 'authentication_error', body: 'login page' },
+    { upstreamStatusCode: 429, expectedType: 'rate_limit_error', body: 'rate limit page' }
+  ];
+
+  for (const testCase of cases) {
+    const upstream = http.createServer((_req, res) => {
+      res.writeHead(testCase.upstreamStatusCode, { 'content-type': 'text/plain' });
+      res.end(testCase.body);
+    });
+
+    const upstreamPort = await listen(upstream);
+    const proxy = http.createServer(createProxyHandler(configFor(`http://127.0.0.1:${upstreamPort}`), {
+      request: httpRequest as RequestFunction,
+      logger: () => undefined,
+      generateRequestId: () => `req-non-json-${testCase.upstreamStatusCode}`
+    }));
+
+    const proxyPort = await listen(proxy);
+
+    try {
+      const response = await requestLocal(proxyPort, { method: 'GET', path: '/v1/models' });
+
+      assert.equal(response.statusCode, testCase.upstreamStatusCode);
+      assert.deepEqual(JSON.parse(response.body), {
+        error: {
+          message: 'Upstream returned non-JSON error response',
+          type: testCase.expectedType,
+          param: null,
+          code: 'upstream_non_json_error',
+          upstream: {
+            statusCode: testCase.upstreamStatusCode,
+            contentType: 'text/plain',
+            bodyBytes: Buffer.byteLength(testCase.body),
+            bodyPreview: testCase.body
+          }
+        }
+      });
+    } finally {
+      await close(proxy);
+      await close(upstream);
+    }
+  }
+});
+
+test('openai-gigachat mode includes diagnostics for malformed upstream models responses', async () => {
+  const logs: Array<Record<string, unknown>> = [];
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('');
+  });
+
+  const upstreamPort = await listen(upstream);
+  const proxy = http.createServer(createProxyHandler(configFor(`http://127.0.0.1:${upstreamPort}`), {
+    request: httpRequest as RequestFunction,
+    logger: (entry) => logs.push(entry),
+    generateRequestId: () => 'req-models-malformed'
+  }));
+
+  const proxyPort = await listen(proxy);
+
+  try {
+    const response = await requestLocal(proxyPort, { method: 'GET', path: '/v1/models' });
+
+    assert.equal(response.statusCode, 502);
+    assert.deepEqual(JSON.parse(response.body), {
+      error: {
+        message: 'Malformed upstream JSON response',
+        type: 'server_error',
+        param: null,
+        code: 'malformed_upstream_response',
+        upstream: {
+          statusCode: 200,
+          contentType: 'text/plain',
+          bodyBytes: 0,
+          bodyPreview: ''
+        }
+      }
+    });
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0].upstreamStatusCode, 200);
+    assert.equal(logs[0].upstreamContentType, 'text/plain');
+    assert.equal(logs[0].upstreamBodyBytes, 0);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test('openai-gigachat mode maps single model endpoints when requested', async () => {
   let receivedUrl: string | undefined;
   const upstream = http.createServer((req, res) => {
@@ -1102,15 +1192,16 @@ test('openai-gigachat mode rejects oversized translated chat request bodies befo
 });
 
 test('openai-gigachat mode returns a safe error for malformed upstream chat JSON', async () => {
+  const logs: Array<Record<string, unknown>> = [];
   const upstream = http.createServer((_req, res) => {
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end('not json');
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html>wrong upstream path</html>');
   });
 
   const upstreamPort = await listen(upstream);
   const proxy = http.createServer(createProxyHandler(configFor(`http://127.0.0.1:${upstreamPort}`), {
     request: httpRequest as RequestFunction,
-    logger: () => undefined,
+    logger: (entry) => logs.push(entry),
     generateRequestId: () => 'req-bad-upstream'
   }));
 
@@ -1129,9 +1220,58 @@ test('openai-gigachat mode returns a safe error for malformed upstream chat JSON
         message: 'Malformed upstream JSON response',
         type: 'server_error',
         param: null,
-        code: 'malformed_upstream_response'
+        code: 'malformed_upstream_response',
+        upstream: {
+          statusCode: 200,
+          contentType: 'text/html',
+          bodyBytes: 32,
+          bodyPreview: '<html>wrong upstream path</html>'
+        }
       }
     });
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0].event, 'request_failed');
+    assert.equal(logs[0].upstreamStatusCode, 200);
+    assert.equal(logs[0].upstreamContentType, 'text/html');
+    assert.equal(logs[0].upstreamBodyBytes, 32);
+    assert.equal(logs[0].upstreamBodyPreview, '<html>wrong upstream path</html>');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('openai-gigachat malformed upstream diagnostics omit authorization headers and request bodies', async () => {
+  const logs: Array<Record<string, unknown>> = [];
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('gateway returned plain text');
+  });
+
+  const upstreamPort = await listen(upstream);
+  const proxy = http.createServer(createProxyHandler(configFor(`http://127.0.0.1:${upstreamPort}`, {
+    forwardAuthorization: true,
+    localAuthToken: 'do-not-leak-token'
+  }), {
+    request: httpRequest as RequestFunction,
+    logger: (entry) => logs.push(entry),
+    generateRequestId: () => 'req-no-secret-diagnostics'
+  }));
+
+  const proxyPort = await listen(proxy);
+
+  try {
+    const response = await requestLocal(proxyPort, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer do-not-leak-token' }
+    }, JSON.stringify({ model: 'secret-model', messages: [{ role: 'user', content: 'do-not-leak-request-body' }] }));
+
+    assert.equal(response.statusCode, 502);
+    const serializedDiagnostics = `${response.body}\n${logs.map((entry) => JSON.stringify(entry)).join('\n')}`;
+    assert.equal(serializedDiagnostics.includes('do-not-leak-token'), false);
+    assert.equal(serializedDiagnostics.includes('do-not-leak-request-body'), false);
+    assert.equal(serializedDiagnostics.includes('gateway returned plain text'), true);
   } finally {
     await close(proxy);
     await close(upstream);

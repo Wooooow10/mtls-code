@@ -16,6 +16,7 @@ function configFor(upstreamBaseUrl: string, overrides: Partial<ProxyConfig> = {}
     clientCert: Buffer.from('cert'),
     clientKey: Buffer.from('key'),
     forwardAuthorization: false,
+    translationMode: 'passthrough',
     upstreamTlsVerify: true,
     upstreamTimeoutMs: 5000,
     ...overrides

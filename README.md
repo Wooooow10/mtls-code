@@ -48,6 +48,7 @@ Defaults:
 - `LISTEN_HOST=127.0.0.1`
 - `LISTEN_PORT=8787`
 - `FORWARD_AUTHORIZATION=false`
+- `TRANSLATION_MODE=passthrough`
 - `UPSTREAM_TLS_VERIFY=true`
 - `UPSTREAM_TIMEOUT_MS=120000`
 
@@ -58,6 +59,28 @@ UPSTREAM_TLS_VERIFY=false
 ```
 
 Use this only as a diagnostic or last-resort workaround. It disables verification of the upstream server certificate; it does not disable sending the configured client certificate and key.
+
+## OpenAI ↔ GigaChat Translation Mode
+
+By default the proxy remains a pass-through proxy. To opt in to OpenAI-compatible request/response translation for the raw GigaChat HTTP API, set:
+
+```bash
+TRANSLATION_MODE=openai-gigachat
+```
+
+MVP translated endpoints:
+
+- `POST /chat/completions` and `POST /v1/chat/completions`
+- `GET /models` and `GET /v1/models`
+- `GET /models/:model` and `GET /v1/models/:model`
+
+In this mode chat requests are sent upstream as GigaChat `/chat/completions` JSON, including tool/function conversion, `response_format.type=json_schema` conversion through a synthetic GigaChat function, and streaming SSE conversion back to OpenAI chat chunks. The translator requests `Accept-Encoding: identity` from upstream and rewrites translated response representation headers. Model list/detail responses are normalized to OpenAI-compatible model objects. Unsupported endpoints return an OpenAI-style error without calling upstream.
+
+`tool_choice` is converted when it names a specific function. String choices `auto` and `required` are removed while leaving converted functions available; `none` is removed and converted functions are not forwarded.
+
+For MVP safety, translated request bodies, non-streaming upstream response bodies, and individual upstream SSE events are each buffered up to 1 MiB. Larger translated requests return `413`; larger upstream buffers return safe `502` errors.
+
+Deferred from this MVP: Responses API, embeddings, files, batches, and image/file attachment uploads in chat messages.
 
 ## OpenCode Configuration
 

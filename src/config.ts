@@ -9,9 +9,12 @@ export interface ProxyConfig {
   caCert?: Buffer;
   localAuthToken?: string;
   forwardAuthorization: boolean;
+  translationMode: TranslationMode;
   upstreamTlsVerify: boolean;
   upstreamTimeoutMs: number;
 }
+
+export type TranslationMode = 'passthrough' | 'openai-gigachat';
 
 type Env = Record<string, string | undefined>;
 
@@ -35,6 +38,7 @@ export function loadConfig(env: Env = process.env, options: LoadConfigOptions = 
     caCert,
     localAuthToken: mergedEnv.LOCAL_AUTH_TOKEN || undefined,
     forwardAuthorization: parseBoolean(mergedEnv.FORWARD_AUTHORIZATION || 'false', 'FORWARD_AUTHORIZATION'),
+    translationMode: parseTranslationMode(mergedEnv.TRANSLATION_MODE || 'passthrough'),
     upstreamTlsVerify: parseBoolean(mergedEnv.UPSTREAM_TLS_VERIFY || 'true', 'UPSTREAM_TLS_VERIFY'),
     upstreamTimeoutMs: parsePositiveInteger(mergedEnv.UPSTREAM_TIMEOUT_MS || '120000', 'UPSTREAM_TIMEOUT_MS')
   };
@@ -145,6 +149,13 @@ function parseBoolean(value: string, name: string): boolean {
     return false;
   }
   throw new Error(`${name} must be true or false`);
+}
+
+function parseTranslationMode(value: string): TranslationMode {
+  if (value === 'passthrough' || value === 'openai-gigachat') {
+    return value;
+  }
+  throw new Error('TRANSLATION_MODE must be passthrough or openai-gigachat');
 }
 
 function readSecretFile(path: string, envName: string): Buffer {

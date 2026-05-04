@@ -45,6 +45,7 @@ test('loadConfig reads required mTLS files and applies safe defaults', () => {
     assert.equal(config.clientKey.toString(), 'test key');
     assert.equal(config.caCert?.toString(), 'test ca');
     assert.equal(config.forwardAuthorization, false);
+    assert.equal(config.translationMode, 'passthrough');
     assert.equal(config.upstreamTlsVerify, true);
     assert.equal(config.upstreamTimeoutMs, 120000);
   });
@@ -94,7 +95,7 @@ test('loadConfig rejects non-HTTPS upstream URLs', () => {
   });
 });
 
-test('loadConfig parses explicit port, local auth, auth forwarding, TLS verification, and timeout', () => {
+test('loadConfig parses explicit port, local auth, auth forwarding, translation mode, TLS verification, and timeout', () => {
   withCertFiles(({ cert, key }) => {
     const config = loadConfigFromEnv({
       LISTEN_HOST: '127.0.0.1',
@@ -104,6 +105,7 @@ test('loadConfig parses explicit port, local auth, auth forwarding, TLS verifica
       CLIENT_KEY_PATH: key,
       LOCAL_AUTH_TOKEN: 'local-secret',
       FORWARD_AUTHORIZATION: 'true',
+      TRANSLATION_MODE: 'openai-gigachat',
       UPSTREAM_TLS_VERIFY: 'false',
       UPSTREAM_TIMEOUT_MS: '5000'
     });
@@ -112,6 +114,7 @@ test('loadConfig parses explicit port, local auth, auth forwarding, TLS verifica
     assert.equal(config.listenPort, 9999);
     assert.equal(config.localAuthToken, 'local-secret');
     assert.equal(config.forwardAuthorization, true);
+    assert.equal(config.translationMode, 'openai-gigachat');
     assert.equal(config.upstreamTlsVerify, false);
     assert.equal(config.upstreamTimeoutMs, 5000);
   });
@@ -138,6 +141,11 @@ test('loadConfig rejects invalid numeric and boolean values', () => {
     assert.throws(
       () => loadConfigFromEnv({ ...baseEnv, UPSTREAM_TLS_VERIFY: 'yes' }),
       /UPSTREAM_TLS_VERIFY must be true or false/
+    );
+
+    assert.throws(
+      () => loadConfigFromEnv({ ...baseEnv, TRANSLATION_MODE: 'translate' }),
+      /TRANSLATION_MODE must be passthrough or openai-gigachat/
     );
 
     assert.throws(

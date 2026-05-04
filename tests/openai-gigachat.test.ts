@@ -193,8 +193,8 @@ test('openai-gigachat mode translates chat request path, headers, messages, tool
     assert.equal(upstreamBody.model, 'GigaChat-Pro');
     assert.equal(upstreamBody.max_tokens, 12);
     assert.equal(upstreamBody.max_output_tokens, undefined);
-    assert.equal(upstreamBody.temperature, undefined);
-    assert.equal(upstreamBody.top_p, 0);
+    assert.equal(upstreamBody.temperature, 0);
+    assert.equal(upstreamBody.top_p, 1);
     assert.deepEqual(upstreamBody.additional_fields, { foo: 'kept', baz: true });
     assert.equal(upstreamBody.extra_body, undefined);
     assert.equal(upstreamBody.reasoning, undefined);
@@ -228,6 +228,59 @@ test('openai-gigachat mode translates chat request path, headers, messages, tool
         }
       }
     });
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('openai-gigachat mode preserves raw HTTP temperature and top_p compatibility', async () => {
+  const receivedBodies: Array<Record<string, unknown>> = [];
+  const upstream = http.createServer((req, res) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      receivedBodies.push(JSON.parse(body));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] }));
+    });
+  });
+
+  const upstreamPort = await listen(upstream);
+  const proxy = http.createServer(createProxyHandler(configFor(`http://127.0.0.1:${upstreamPort}`), {
+    request: httpRequest as RequestFunction,
+    logger: () => undefined,
+    generateRequestId: () => 'req-temperature'
+  }));
+
+  const proxyPort = await listen(proxy);
+
+  try {
+    const requests = [
+      { model: 'temp-model', messages: [{ role: 'user', content: 'absent' }] },
+      { model: 'temp-model', messages: [{ role: 'user', content: 'top-p' }], top_p: 0.7 },
+      { model: 'temp-model', messages: [{ role: 'user', content: 'zero' }], temperature: 0, top_p: 0.9 }
+    ];
+
+    for (const requestBody of requests) {
+      const response = await requestLocal(proxyPort, {
+        method: 'POST',
+        path: '/v1/chat/completions',
+        headers: { 'content-type': 'application/json' }
+      }, JSON.stringify(requestBody));
+      assert.equal(response.statusCode, 200);
+    }
+
+    assert.equal(receivedBodies.length, 3);
+    assert.equal(receivedBodies[0].temperature, undefined);
+    assert.equal(receivedBodies[0].top_p, undefined);
+    assert.equal(receivedBodies[1].temperature, undefined);
+    assert.equal(receivedBodies[1].top_p, 0.7);
+    assert.equal(receivedBodies[2].temperature, 0);
+    assert.equal(receivedBodies[2].top_p, 0.9);
   } finally {
     await close(proxy);
     await close(upstream);

@@ -124,11 +124,6 @@ export function transformChatCompletionRequest(data: unknown): ChatRequestTransf
     delete transformed.max_output_tokens;
   }
 
-  if (!('temperature' in transformed) || transformed.temperature === 0) {
-    delete transformed.temperature;
-    transformed.top_p = 0;
-  }
-
   if ('extra_body' in transformed) {
     transformed.additional_fields = mergeAdditionalFields(transformed.extra_body, transformed.additional_fields);
     delete transformed.extra_body;
